@@ -162,12 +162,13 @@ SHARP_PROFILES = {
 ENCODE_TUNE = "animation"    # réglage pour animes / dessins ; None pour des films
 AUDIO_BITRATE = "192k"
 
-# Compression (réservé à l'administrateur) : réduire vraiment la taille du
-# fichier, quitte à perdre en qualité. (libellé, hauteur max, CRF, audio)
-COMPRESS_PROFILES = {
-    "light": ("Légère", 720, 26, "128k"),
-    "medium": ("Moyenne", 480, 30, "96k"),
-    "strong": ("Forte", 360, 34, "64k"),
+# Convertir (fonction avancée) : changer la résolution de la vidéo.
+# (libellé, hauteur cible, CRF, audio)
+CONVERT_PROFILES = {
+    "1080": ("1080p", 1080, 23, "160k"),
+    "720": ("720p", 720, 25, "128k"),
+    "480": ("480p", 480, 28, "96k"),
+    "360": ("360p", 360, 32, "64k"),
 }
 
 # Polices essayées (dans cet ordre) pour les sous-titres incrustés
@@ -1549,7 +1550,7 @@ def register_user(uid, sender=None, status="pending"):
     if not rec:
         rec = {
             "status": status, "since": time.time(), "decided": 0,
-            "name": "Utilisateur", "username": "", "uses": 0,
+            "name": "Utilisateur", "username": "", "uses": 0, "advanced": False,
             **DEFAULT_PREFS,
         }
         users[str(uid)] = rec
@@ -1610,6 +1611,14 @@ def set_pref(uid, key, value):
         rec = register_user(uid, None, "admin" if uid == ADMIN_ID else "open")
     rec[key] = value
     save_users()
+
+
+def has_advanced(uid):
+    """Convertir et Supprimer une piste audio : toi, ou une personne autorisée explicitement."""
+    if uid == ADMIN_ID:
+        return True
+    rec = users.get(str(uid))
+    return bool(rec and rec.get("advanced"))
 
 
 def counts():
@@ -1887,8 +1896,52 @@ SCREEN_TITLES = {
     "extract": ("⇩", "Télécharger les sous-titres"),
     "src": ("◆", "Source des sous-titres"),
     "hs": ("▶", "Hardsub"),
-    "compress": ("⇲", "Compresser"),
+    "convert": ("⇲", "Convertir"),
+    "audio": ("♪", "Garder une seule piste audio"),
 }
+
+
+def probe_audio(path):
+    """Liste les pistes audio d'une vidéo."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index,codec_name,channels:stream_tags=language,title",
+            "-of", "json", str(path),
+        ]
+        output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=60)
+        data = json.loads(output.decode())
+    except Exception:
+        return []
+
+    tracks = []
+    for s in data.get("streams", []):
+        tags = s.get("tags") or {}
+        tracks.append({
+            "index": s["index"],
+            "codec": s.get("codec_name") or "?",
+            "channels": s.get("channels"),
+            "lang": tags.get("language") or "und",
+            "title": tags.get("title") or "",
+        })
+    return tracks
+
+
+def audio_track_labels(tracks):
+    labels = {}
+    seen = {}
+    for t in tracks:
+        name = LANG_NAMES.get(t["lang"]) or t["lang"].upper()
+        ch = {1: "mono", 2: "stéréo", 6: "5.1", 8: "7.1"}.get(t["channels"], f"{t['channels']} canaux" if t["channels"] else "")
+        extra = (t["title"] or "").strip()
+        label = name + (f" ({extra})" if extra and extra.lower() != name.lower() else "")
+        if ch:
+            label += f" · {ch}"
+        seen[label] = seen.get(label, 0) + 1
+        if seen[label] > 1:
+            label += f" #{seen[label]}"
+        labels[t["index"]] = label
+    return labels
 
 
 def job_text(job, note=""):
@@ -1941,14 +1994,28 @@ def job_text(job, note=""):
             "comme à la télé.</i>",
         ]
 
-    elif view == "compress":
-        _, h, crf, ab = COMPRESS_PROFILES[job["compress"]]
+    elif view == "convert":
+        label = CONVERT_PROFILES[job["convert"]][0]
         lines += [
             "",
-            kv([("Qualité", COMPRESS_PROFILES[job["compress"]][0]), ("Cible", f"{h}p")]),
+            kv([("Résolution cible", label)]),
             "",
-            "<i>Réduit nettement la taille du fichier (image et son moins fins).</i>",
+            "<i>Change la résolution de la vidéo (ex : 1080p vers 720p).</i>",
         ]
+
+    elif view == "audio":
+        tracks = job.get("audio_tracks")
+        if tracks is None:
+            lines += ["", "<i>Analyse des pistes audio…</i>"]
+        elif len(tracks) <= 1:
+            lines += ["", "<i>Une seule piste audio : rien à retirer.</i>"]
+        else:
+            labels = audio_track_labels(tracks)
+            lines += [
+                "",
+                f"<b>{len(tracks)}</b> pistes audio. Choisis celle à garder :",
+                bullets([labels[t["index"]] for t in tracks], mark="▸"),
+            ]
 
     if note:
         lines += ["", note]
@@ -1970,20 +2037,38 @@ def job_rows(job):
                 btn("Hardsub", f"hsopen|{jid}", "primary"),
             ],
         ]
-        if job["uid"] == ADMIN_ID:
-            rows.append([btn("Compresser", f"cmpopen|{jid}")])
+        if has_advanced(job["uid"]):
+            rows.append([
+                btn("Convertir", f"cvopen|{jid}"),
+                btn("Garder 1 piste audio", f"adopen|{jid}"),
+            ])
         rows.append([btn("Annuler", f"cancel|{jid}", "danger")])
         return rows
 
-    if view == "compress":
+    if view == "convert":
         rows = [[
-            btn(v[0], f"cmpq|{jid}|{k}", sel(job["compress"] == k))
-            for k, v in COMPRESS_PROFILES.items()
+            btn(v[0], f"cvq|{jid}|{k}", sel(job["convert"] == k))
+            for k, v in CONVERT_PROFILES.items()
         ]]
         rows.append([
-            btn("Lancer", f"cmprun|{jid}", "success"),
+            btn("Lancer", f"cvrun|{jid}", "success"),
             btn("Retour", f"view|{jid}|menu"),
         ])
+        return rows
+
+    if view == "audio":
+        tracks = job.get("audio_tracks") or []
+        rows = []
+        if len(tracks) > 1:
+            labels = audio_track_labels(tracks)
+            line = []
+            for t in tracks:
+                line.append(btn(labels[t["index"]], f"adrun|{jid}|{t['index']}", "success"))
+                if len(line) == 2:
+                    rows.append(line); line = []
+            if line:
+                rows.append(line)
+        rows.append([btn("Retour", f"view|{jid}|menu")])
         return rows
 
     if view == "extract":
@@ -2223,6 +2308,7 @@ def user_text(uid):
             ("Statut", STATUS_LABELS.get(rec["status"], rec["status"])),
             ("Depuis", since),
             ("Vidéos", rec.get("uses", 0)),
+            ("Fonctions avancées", "Autorisées" if rec.get("advanced") else "Non autorisées"),
         ])
     )
 
@@ -2240,6 +2326,11 @@ def user_rows(uid):
             rows.append([btn("Refuser", f"adm|set|{uid}|refused")])
         if status != "blocked":
             rows.append([btn("Bloquer", f"adm|set|{uid}|blocked", "danger")])
+
+        if rec.get("advanced"):
+            rows.append([btn("Retirer Convertir / Supprimer piste", f"adm|adv|{uid}|0", "danger")])
+        else:
+            rows.append([btn("Autoriser Convertir / Supprimer piste", f"adm|adv|{uid}|1", "success")])
 
     rows.append([btn("Retour à la liste", "adm|users|0")])
     return rows
@@ -2454,7 +2545,8 @@ async def new_job(event):
         "style": p["style"],
         "fsize": p["size"],
         "fmt": p["fmt"],
-        "compress": "medium",
+        "convert": "720",
+        "audio_tracks": None,
         "extracted": set(),
         "track_names": {},
         "used_names": set(),
@@ -2693,7 +2785,7 @@ async def on_button(event):
 
     # ---------------- NAVIGATION ENTRE LES ÉCRANS ----------------
     if kind == "view":
-        if value not in ("menu", "hs", "src", "compress"):
+        if value not in ("menu", "hs", "src", "convert", "audio"):
             await event.answer()
             return
 
@@ -2743,26 +2835,42 @@ async def on_button(event):
         return
 
     # ---------------- COMPRESSION (réservé à l'administrateur) ----------------
-    if kind in ("cmpopen", "cmpq", "cmprun"):
-        if uid != ADMIN_ID:
-            await event.answer("Réservé à l'administrateur.", alert=True)
+    if kind in ("cvopen", "cvq", "cvrun", "adopen", "adrun"):
+        if not has_advanced(uid):
+            await event.answer("Fonction non autorisée.", alert=True)
             return
 
-        if kind == "cmpopen":
-            job["view"] = "compress"
+        if kind == "cvopen":
+            job["view"] = "convert"
             await event.answer()
             await refresh_panel(job)
             return
 
-        if kind == "cmpq" and value in COMPRESS_PROFILES:
-            job["compress"] = value
-            await event.answer("Qualité : " + COMPRESS_PROFILES[value][0])
+        if kind == "cvq" and value in CONVERT_PROFILES:
+            job["convert"] = value
+            await event.answer("Résolution : " + CONVERT_PROFILES[value][0])
             await refresh_panel(job)
             return
 
-        if kind == "cmprun":
+        if kind == "cvrun":
             await event.answer("C'est parti")
-            job["task"] = run_in_background(process_compress(job))
+            job["task"] = run_in_background(process_convert(job))
+            return
+
+        if kind == "adopen":
+            job["view"] = "audio"
+            await event.answer("Analyse…")
+            job["task"] = run_in_background(scan_audio(job))
+            return
+
+        if kind == "adrun":
+            try:
+                index = int(value)
+            except (TypeError, ValueError):
+                await event.answer()
+                return
+            await event.answer("C'est parti")
+            job["task"] = run_in_background(process_audio(job, index))
             return
 
         await event.answer()
@@ -2907,6 +3015,19 @@ async def admin_action(event, panel, parts):
             )
         else:
             await panel.edit(user_text(str(uid)), user_rows(str(uid)))
+        return
+
+    if action == "adv" and len(parts) > 3:
+        uid = int(parts[2])
+        on = parts[3] == "1"
+        rec = users.get(str(uid))
+        if rec is None:
+            await event.answer("Utilisateur introuvable.", alert=True)
+            return
+        rec["advanced"] = on
+        save_users()
+        await event.answer("Autorisé" if on else "Autorisation retirée")
+        await panel.edit(user_text(str(uid)), user_rows(str(uid)))
         return
 
     if action == "bc":
@@ -3355,15 +3476,15 @@ async def send_output(job, progress, output_path, final_name):
     return {"q": q, "d": d, "size": out_size}
 
 
-async def process_compress(job):
-    """Compresse la vidéo (réservé à l'administrateur) : réduit nettement la taille."""
+async def process_convert(job):
+    """Convertit la vidéo vers une autre résolution (fonction avancée)."""
     jid = job["id"]
     work_dir = job["dir"]
     job["state"] = "running"
     job["t0"] = time.time()
 
     progress = Progress(job)
-    label, height, crf, audio_br = COMPRESS_PROFILES[job["compress"]]
+    label, height, crf, audio_br = CONVERT_PROFILES[job["convert"]]
 
     try:
         async with Turn(job):
@@ -3373,14 +3494,13 @@ async def process_compress(job):
             duration = float(info_src["duration"]) if info_src["duration"] else None
             in_size = os.path.getsize(input_path)
 
-            final_name = clean_name(Path(job["filename"]).stem) + "_compressed.mp4"
+            final_name = clean_name(Path(job["filename"]).stem) + f"_{label}.mp4"
             output_path = work_dir / clean_name(final_name)
 
-            vf = None
-            if info_src["height"] and info_src["height"] > height:
-                vf = f"scale=-2:{height}:flags=lanczos"
+            already_smaller = info_src["height"] and info_src["height"] <= height
+            vf = None if already_smaller else f"scale=-2:{height}:flags=lanczos"
 
-            await progress.start(f"Compression · {label}", "Peut prendre plusieurs minutes")
+            await progress.start(f"Conversion · {label}", "Peut prendre plusieurs minutes")
 
             t_convert = time.time()
 
@@ -3405,22 +3525,133 @@ async def process_compress(job):
             )
 
             if not ok:
-                raise RuntimeError(f"La compression a échoué. {err}")
+                raise RuntimeError(f"La conversion a échoué. {err}")
 
             job["times"]["convert"] = time.time() - t_convert
             input_path.unlink(missing_ok=True)
 
             res = await send_output(job, progress, output_path, final_name)
 
-            reduction = (1 - res["size"] / in_size) * 100 if in_size else 0
-
             text = (
-                header("✓", "Compression terminée") + f"\n{DIV}\n"
+                header("✓", "Conversion terminée") + f"\n{DIV}\n"
                 + kv([
+                    ("Résolution cible", label),
                     ("Avant", format_size(in_size)),
                     ("Après", format_size(res["size"])),
-                    ("Réduction", f"{reduction:.0f} %"),
-                    ("Qualité", label),
+                    ("Résolution finale", res["q"]),
+                ])
+            )
+            await job["panel"].edit(text)
+
+    except (asyncio.CancelledError, FloodWaitError, Exception) as e:
+        progress.stop()
+
+        if isinstance(e, asyncio.CancelledError):
+            await job["panel"].edit(header("✕", "Traitement arrêté"))
+        elif isinstance(e, FloodWaitError):
+            await job["panel"].edit(
+                header("⚠", "Telegram demande d'attendre") + f"\n{DIV}\n<i>{e.seconds} secondes.</i>"
+            )
+        else:
+            await job["panel"].edit(
+                header("⚠", "Erreur") + f"\n{DIV}\n<blockquote>{esc(f'{type(e).__name__}: {e}')}</blockquote>"
+            )
+
+    finally:
+        progress.stop()
+        drop_job(jid)
+
+
+async def scan_audio(job):
+    """Cherche toutes les pistes audio de la vidéo (fonction avancée)."""
+    job["state"] = "running"
+    progress = Progress(job)
+    note = ""
+
+    try:
+        src = await ensure_source(job, progress)
+        job["audio_tracks"] = await asyncio.to_thread(probe_audio, src)
+
+    except (asyncio.CancelledError, FloodWaitError, Exception) as e:
+        job["view"] = "menu"
+        if isinstance(e, asyncio.CancelledError):
+            note = "<i>Analyse arrêtée.</i>"
+        else:
+            note = f"<i>Erreur : {esc(str(e))}</i>"
+
+    finally:
+        progress.stop()
+        if job["id"] in jobs:
+            job["state"] = "choosing"
+            try:
+                await refresh_panel(job, note)
+            except Exception:
+                pass
+
+
+async def process_audio(job, keep_index):
+    """Ne garde qu'une seule piste audio (fonction avancée), sans ré-encoder (rapide)."""
+    jid = job["id"]
+    work_dir = job["dir"]
+    job["state"] = "running"
+    job["t0"] = time.time()
+
+    progress = Progress(job)
+    tracks = job.get("audio_tracks") or []
+    labels = audio_track_labels(tracks)
+    label = labels.get(keep_index, str(keep_index))
+
+    try:
+        async with Turn(job):
+            input_path = await ensure_source(job, progress)
+
+            duration_info = await asyncio.to_thread(media_info, input_path)
+            duration = float(duration_info["duration"]) if duration_info["duration"] else None
+
+            final_name = clean_name(Path(job["filename"]).stem) + ".mp4"
+            output_path = work_dir / clean_name(final_name)
+
+            await progress.start(f"Audio · {label}")
+
+            t_convert = time.time()
+
+            # D'abord sans ré-encoder (rapide) ; si le conteneur n'aime pas
+            # la copie telle quelle, on ré-encode l'audio en repli.
+            attempts = [
+                ["-c:v", "copy", "-c:a", "copy"],
+                ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"],
+            ]
+            ok, err = False, ""
+
+            for codecs in attempts:
+                ok, err = await run_ffmpeg(
+                    [
+                        "-i", str(input_path),
+                        "-map", "0:v:0", "-map", f"0:{keep_index}",
+                        *codecs,
+                        "-sn", "-movflags", "+faststart",
+                        str(output_path),
+                    ],
+                    duration,
+                    progress.pct,
+                )
+                if ok:
+                    break
+                output_path.unlink(missing_ok=True)
+
+            if not ok:
+                raise RuntimeError(f"Opération impossible. {err}")
+
+            job["times"]["convert"] = time.time() - t_convert
+            input_path.unlink(missing_ok=True)
+
+            res = await send_output(job, progress, output_path, final_name)
+
+            text = (
+                header("✓", "Terminé") + f"\n{DIV}\n"
+                + kv([
+                    ("Piste gardée", label),
+                    ("Taille", format_size(res["size"])),
                     ("Résolution", res["q"]),
                 ])
             )
